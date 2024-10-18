@@ -84,6 +84,30 @@ pub trait Weighted {
 
 /// Create a new cache from the provided config.  This is solely for caches that cannot implement
 /// the persistent cache trait.  Attempts to construct a disk-based cache will return an error.
+pub async fn from_config_with_event_listener<K, V>(
+    config: &CacheConfig,
+    tx: tokio::sync::mpsc::UnboundedSender<K>,
+) -> Result<Box<dyn Cache<K, V>>, Box<dyn ChromaError>>
+where
+    K: Clone + Send + Sync + Eq + PartialEq + Hash + 'static,
+    V: Clone + Send + Sync + Weighted + 'static,
+{
+    match config {
+        CacheConfig::Unbounded(_) => Err(Box::new(CacheError::InvalidCacheConfig(
+            "from_config_with_event_listener was called with unbounded".to_string(),
+        ))),
+        CacheConfig::Memory(c) => Ok(c.build_memory_with_event_listener(tx).await? as _),
+        CacheConfig::Disk(_) => Err(Box::new(CacheError::InvalidCacheConfig(
+            "from_config_with_event_listener was called with disk".to_string(),
+        ))),
+        CacheConfig::Nop => Err(Box::new(CacheError::InvalidCacheConfig(
+            "from_config_with_event_listener was called with nop".to_string(),
+        ))),
+    }
+}
+
+/// Create a new cache from the provided config.  This is solely for caches that cannot implement
+/// the persistent cache trait.  Attempts to construct a disk-based cache will return an error.
 pub async fn from_config<K, V>(
     config: &CacheConfig,
 ) -> Result<Box<dyn Cache<K, V>>, Box<dyn ChromaError>>
@@ -95,7 +119,7 @@ where
         CacheConfig::Unbounded(unbounded_config) => {
             Ok(Box::new(UnboundedCache::new(unbounded_config)))
         }
-        CacheConfig::Memory(c) => Ok(c.build_memory().await? as _),
+        CacheConfig::Memory(c) => Ok(c.build_memory().await?),
         CacheConfig::Disk(_) => Err(Box::new(CacheError::InvalidCacheConfig(
             "from_config was called with disk".to_string(),
         ))),
@@ -116,7 +140,7 @@ where
             Ok(Box::new(UnboundedCache::new(unbounded_config)))
         }
         CacheConfig::Memory(c) => Ok(c.build_memory_persistent().await?),
-        CacheConfig::Disk(c) => Ok(c.build_hybrid().await? as _),
+        CacheConfig::Disk(c) => Ok(c.build_hybrid().await?),
         CacheConfig::Nop => Ok(Box::new(NopCache)),
     }
 }

@@ -180,7 +180,7 @@ impl ZipfCache {
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct Connection {
     pub url: String,
-    pub api_key: String,
+    pub api_key: Option<String>,
     pub database: String,
 }
 
@@ -188,12 +188,17 @@ pub struct Connection {
 
 /// Instantiate a new Chroma client.
 pub async fn client(connection: Connection) -> ChromaClient {
+    let auth = if let Some(api_key) = connection.api_key.clone() {
+        ChromaAuthMethod::TokenAuth {
+            token: api_key,
+            header: ChromaTokenHeader::XChromaToken,
+        }
+    } else {
+        ChromaAuthMethod::None
+    };
     ChromaClient::new(ChromaClientOptions {
         url: Some(connection.url.clone()),
-        auth: ChromaAuthMethod::TokenAuth {
-            token: connection.api_key.clone(),
-            header: ChromaTokenHeader::XChromaToken,
-        },
+        auth,
         database: connection.database.clone(),
     })
     .await
@@ -1026,8 +1031,16 @@ pub struct LoadHarness {
 
 impl LoadHarness {
     /// The status of the load harness.
+    /// This returns the list of running workloads with secrets redacted.
     pub fn status(&self) -> Vec<RunningWorkload> {
-        self.running.clone()
+        self.running
+            .iter()
+            .map(|w| {
+                let mut w = w.clone();
+                w.connection.api_key = Some("REDACTED".to_string());
+                w
+            })
+            .collect()
     }
 
     /// Start a workload on the load harness.
@@ -1736,7 +1749,7 @@ mod tests {
             "nop".to_string(),
             Connection {
                 url: "http://localhost:8000".to_string(),
-                api_key: "".to_string(),
+                api_key: None,
                 database: "".to_string(),
             },
             (chrono::Utc::now() + chrono::Duration::seconds(10)).into(),
@@ -1848,7 +1861,7 @@ mod tests {
             "nop".to_string(),
             Connection {
                 url: "http://localhost:8000".to_string(),
-                api_key: "".to_string(),
+                api_key: None,
                 database: "".to_string(),
             },
             (chrono::Utc::now() + chrono::Duration::seconds(10)).into(),

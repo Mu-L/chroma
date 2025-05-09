@@ -1,11 +1,14 @@
 use super::util::TokenInstance;
+use super::util::TokenInstanceEncodeError;
 use chroma_blockstore::{BlockfileFlusher, BlockfileReader, BlockfileWriter};
 use chroma_error::{ChromaError, ErrorCodes};
+use chroma_types::regex::literal_expr::NgramLiteralProvider;
 use futures::StreamExt;
 use itertools::Itertools;
 use parking_lot::Mutex;
 use roaring::RoaringBitmap;
 use std::collections::HashSet;
+use std::ops::RangeBounds;
 use std::sync::Arc;
 use tantivy::tokenizer::NgramTokenizer;
 use tantivy::tokenizer::TokenStream;
@@ -19,8 +22,8 @@ pub enum FullTextIndexError {
     EmptyValueInPositionalPostingList,
     #[error("Invariant violation")]
     InvariantViolation,
-    #[error("Blockfile write error: {0}")]
-    BlockfileWriteError(#[from] Box<dyn ChromaError>),
+    #[error("Blockfile error: {0}")]
+    BlockfileError(#[from] Box<dyn ChromaError>),
 }
 
 impl ChromaError for FullTextIndexError {
@@ -85,11 +88,16 @@ impl FullTextIndexWriter {
                         .clone()
                         .token_stream(new_document)
                         .process(&mut |token| {
-                            token_instances.push(TokenInstance::encode(
+                            match TokenInstance::encode(
                                 token.text.as_str(),
                                 offset_id,
                                 Some(token.offset_from as u32),
-                            ));
+                            ) {
+                                Ok(encoded) => token_instances.push(encoded),
+                                Err(TokenInstanceEncodeError::NullTerminator) => {
+                                    // ignore
+                                }
+                            }
                         });
                 }
 
@@ -104,11 +112,14 @@ impl FullTextIndexWriter {
                         .clone()
                         .token_stream(old_document)
                         .process(&mut |token| {
-                            trigrams_to_delete.insert(TokenInstance::encode(
-                                token.text.as_str(),
-                                offset_id,
-                                None,
-                            ));
+                            match TokenInstance::encode(token.text.as_str(), offset_id, None) {
+                                Ok(encoded) => {
+                                    trigrams_to_delete.insert(encoded);
+                                }
+                                Err(TokenInstanceEncodeError::NullTerminator) => {
+                                    // ignore
+                                }
+                            }
                         });
 
                     // Add doc
@@ -116,17 +127,27 @@ impl FullTextIndexWriter {
                         .clone()
                         .token_stream(new_document)
                         .process(&mut |token| {
-                            trigrams_to_delete.remove(&TokenInstance::encode(
-                                token.text.as_str(),
-                                offset_id,
-                                None,
-                            ));
+                            match TokenInstance::encode(token.text.as_str(), offset_id, None) {
+                                Ok(encoded) => {
+                                    trigrams_to_delete.remove(&encoded);
+                                }
+                                Err(TokenInstanceEncodeError::NullTerminator) => {
+                                    // ignore
+                                }
+                            }
 
-                            token_instances.push(TokenInstance::encode(
+                            match TokenInstance::encode(
                                 token.text.as_str(),
                                 offset_id,
                                 Some(token.offset_from as u32),
-                            ));
+                            ) {
+                                Ok(encoded) => {
+                                    token_instances.push(encoded);
+                                }
+                                Err(TokenInstanceEncodeError::NullTerminator) => {
+                                    // ignore
+                                }
+                            }
                         });
 
                     token_instances.extend(trigrams_to_delete.into_iter());
@@ -143,11 +164,14 @@ impl FullTextIndexWriter {
                         .clone()
                         .token_stream(old_document)
                         .process(&mut |token| {
-                            trigrams_to_delete.insert(TokenInstance::encode(
-                                token.text.as_str(),
-                                offset_id,
-                                None,
-                            ));
+                            match TokenInstance::encode(token.text.as_str(), offset_id, None) {
+                                Ok(encoded) => {
+                                    trigrams_to_delete.insert(encoded);
+                                }
+                                Err(TokenInstanceEncodeError::NullTerminator) => {
+                                    // ignore
+                                }
+                            }
                         });
 
                     token_instances.extend(trigrams_to_delete.into_iter());
@@ -246,7 +270,7 @@ impl FullTextIndexFlusher {
         {
             Ok(_) => {}
             Err(e) => {
-                return Err(FullTextIndexError::BlockfileWriteError(e));
+                return Err(FullTextIndexError::BlockfileError(e));
             }
         };
 
@@ -313,7 +337,7 @@ impl<'me> FullTextIndexReader<'me> {
                 .enumerate()
                 .map(|(i, posting_list)| {
                     if pointers[i] < posting_list.len() {
-                        Some(posting_list[pointers[i]].0)
+                        Some(posting_list[pointers[i]].1)
                     } else {
                         None
                     }
@@ -333,7 +357,7 @@ impl<'me> FullTextIndexReader<'me> {
                 // All tokens appear in the same document, so check positional alignment.
                 let mut positions_per_posting_list = Vec::with_capacity(num_tokens);
                 for (i, posting_list) in posting_lists.iter().enumerate() {
-                    let (_, positions) = posting_list[pointers[i]];
+                    let (_, _, positions) = posting_list[pointers[i]];
                     positions_per_posting_list.push(positions);
                 }
 
@@ -396,10 +420,30 @@ impl<'me> FullTextIndexReader<'me> {
             .get_range(token..=token, ..)
             .await?;
         let mut results = vec![];
-        for (doc_id, positions) in positional_posting_list.iter() {
+        for (_, doc_id, positions) in positional_posting_list.iter() {
             results.push((*doc_id, positions.to_vec()));
         }
         Ok(results)
+    }
+}
+
+#[async_trait::async_trait]
+impl<'reader> NgramLiteralProvider<FullTextIndexError> for FullTextIndexReader<'reader> {
+    fn maximum_branching_factor(&self) -> usize {
+        6
+    }
+
+    async fn lookup_ngram_range<'me, NgramRange>(
+        &'me self,
+        ngram_range: NgramRange,
+    ) -> Result<Vec<(&'me str, u32, &'me [u32])>, FullTextIndexError>
+    where
+        NgramRange: Clone + RangeBounds<&'me str> + Send + Sync,
+    {
+        Ok(self
+            .posting_lists_blockfile_reader
+            .get_range(ngram_range, ..)
+            .await?)
     }
 }
 
@@ -907,6 +951,44 @@ mod tests {
 
         let res = index_reader.get_all_results_for_token("l").await.unwrap();
         assert_eq!(res.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_document_with_null_terminators() {
+        let tmp_dir = tempdir().unwrap();
+        let storage = Storage::Local(LocalStorage::new(tmp_dir.path().to_str().unwrap()));
+        let block_cache = new_cache_for_test();
+        let root_cache = new_cache_for_test();
+        let provider = BlockfileProvider::new_arrow(storage, 1024 * 1024, block_cache, root_cache);
+        let pl_blockfile_writer = provider
+            .write::<u32, Vec<u32>>(BlockfileWriterOptions::default().ordered_mutations())
+            .await
+            .unwrap();
+        let pl_blockfile_id = pl_blockfile_writer.id();
+
+        let tokenizer = NgramTokenizer::new(3, 3, false).unwrap();
+        let mut index_writer = FullTextIndexWriter::new(pl_blockfile_writer, tokenizer.clone());
+
+        index_writer
+            .handle_batch([DocumentMutation::Create {
+                offset_id: 1,
+                new_document: "hello \0 wor\0ld",
+            }])
+            .unwrap();
+
+        index_writer.write_to_blockfiles().await.unwrap();
+        let flusher = index_writer.commit().await.unwrap();
+        flusher.flush().await.unwrap();
+
+        let pl_blockfile_reader = provider
+            .read::<u32, &[u32]>(&pl_blockfile_id)
+            .await
+            .unwrap();
+        let tokenizer = NgramTokenizer::new(3, 3, false).unwrap();
+        let index_reader = FullTextIndexReader::new(pl_blockfile_reader, tokenizer);
+
+        let res = index_reader.search("hello").await.unwrap();
+        assert_eq!(res, RoaringBitmap::from([1]));
     }
 
     #[tokio::test]

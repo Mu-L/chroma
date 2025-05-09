@@ -7,16 +7,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
+use chroma_cache::CacheConfig;
 use chroma_config::Configurable;
 use chroma_error::ChromaError;
 use chroma_storage::config::StorageConfig;
 use chroma_storage::Storage;
 use chroma_types::chroma_proto::{
     log_service_server::LogService, CollectionInfo, GetAllCollectionInfoToCompactRequest,
-    GetAllCollectionInfoToCompactResponse, LogRecord, OperationRecord, PullLogsRequest,
-    PullLogsResponse, PurgeDirtyForCollectionRequest, PurgeDirtyForCollectionResponse,
-    PushLogsRequest, PushLogsResponse, ScoutLogsRequest, ScoutLogsResponse,
-    UpdateCollectionLogOffsetRequest, UpdateCollectionLogOffsetResponse,
+    GetAllCollectionInfoToCompactResponse, InspectDirtyLogRequest, InspectDirtyLogResponse,
+    LogRecord, OperationRecord, PullLogsRequest, PullLogsResponse, PurgeDirtyForCollectionRequest,
+    PurgeDirtyForCollectionResponse, PushLogsRequest, PushLogsResponse, ScoutLogsRequest,
+    ScoutLogsResponse, UpdateCollectionLogOffsetRequest, UpdateCollectionLogOffsetResponse,
 };
 use chroma_types::chroma_proto::{ForkLogsRequest, ForkLogsResponse};
 use chroma_types::CollectionUuid;
@@ -221,6 +222,19 @@ async fn get_log_from_handle<'a>(
         log: opened,
         _phantom: std::marker::PhantomData,
     })
+}
+
+////////////////////////////////////////// CachedFragment //////////////////////////////////////////
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct CachedParquetFragment {
+    bytes: Vec<u8>,
+}
+
+impl chroma_cache::Weighted for CachedParquetFragment {
+    fn weight(&self) -> usize {
+        self.bytes.len()
+    }
 }
 
 ////////////////////////////////////////////// Rollup //////////////////////////////////////////////
@@ -593,6 +607,7 @@ pub struct LogServer {
     open_logs: Arc<StateHashTable<LogKey, LogStub>>,
     dirty_log: Arc<LogWriter>,
     compacting: tokio::sync::Mutex<()>,
+    cache: Option<Box<dyn chroma_cache::PersistentCache<String, CachedParquetFragment>>>,
 }
 
 #[async_trait::async_trait]
@@ -736,7 +751,22 @@ impl LogService for LogServer {
             };
             let futures = fragments
                 .iter()
-                .map(|fragment| async { log_reader.fetch(fragment).await })
+                .map(|fragment| async {
+                    let cache_key = format!("{collection_id}::{}", fragment.path);
+                    if let Some(cache) = self.cache.as_ref() {
+                        if let Ok(Some(answer)) = cache.get(&cache_key).await {
+                            return Ok(Arc::new(answer.bytes));
+                        }
+                        let answer = log_reader.fetch(fragment).await?;
+                        let cache_value = CachedParquetFragment {
+                            bytes: Clone::clone(&*answer),
+                        };
+                        cache.insert(cache_key, cache_value).await;
+                        Ok(answer)
+                    } else {
+                        log_reader.fetch(fragment).await
+                    }
+                })
                 .collect::<Vec<_>>();
             let parquets = futures::future::try_join_all(futures)
                 .await
@@ -1080,6 +1110,65 @@ impl LogService for LogServer {
             .map_err(|err| Status::new(err.code().into(), err.to_string()))?;
         Ok(Response::new(PurgeDirtyForCollectionResponse {}))
     }
+
+    #[tracing::instrument(skip(self, _request))]
+    async fn inspect_dirty_log(
+        &self,
+        _request: Request<InspectDirtyLogRequest>,
+    ) -> Result<Response<InspectDirtyLogResponse>, Status> {
+        let Some(reader) = self.dirty_log.reader(LogReaderOptions::default()) else {
+            return Err(Status::unavailable("Failed to get dirty log reader"));
+        };
+        let Some(cursors) = self.dirty_log.cursors(CursorStoreOptions::default()) else {
+            return Err(Status::unavailable("Failed to get dirty log cursors"));
+        };
+        let witness = match cursors.load(&STABLE_PREFIX).await {
+            Ok(witness) => witness,
+            Err(err) => {
+                return Err(Status::new(err.code().into(), err.to_string()));
+            }
+        };
+        let default = Cursor::default();
+        let cursor = witness.as_ref().map(|w| w.cursor()).unwrap_or(&default);
+        tracing::info!("cursoring from {cursor:?}");
+        let dirty_fragments = reader
+            .scan(
+                cursor.position,
+                Limits {
+                    max_files: Some(1_000_000),
+                    max_bytes: Some(1_000_000_000),
+                },
+            )
+            .await
+            .map_err(|err| Status::new(err.code().into(), err.to_string()))?;
+        let dirty_futures = dirty_fragments
+            .iter()
+            .map(|fragment| reader.read_parquet(fragment))
+            .collect::<Vec<_>>();
+        let dirty_raw = futures::future::try_join_all(dirty_futures)
+            .await
+            .map_err(|err| {
+                Status::new(
+                    err.code().into(),
+                    format!("Failed to fetch dirty parquet: {}", err),
+                )
+            })?;
+        let mut markers = vec![];
+        for (_, records, _) in dirty_raw {
+            let records = records
+                .into_iter()
+                .map(|x| String::from_utf8(x.1))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| {
+                    Status::new(
+                        chroma_error::ErrorCodes::DataLoss.into(),
+                        format!("Failed to extract records: {}", err),
+                    )
+                })?;
+            markers.extend(records);
+        }
+        Ok(Response::new(InspectDirtyLogResponse { markers }))
+    }
 }
 
 fn parquet_to_records(parquet: Arc<Vec<u8>>) -> Result<Vec<(LogPosition, Vec<u8>)>, Status> {
@@ -1290,6 +1379,8 @@ pub struct LogServerConfig {
     pub writer: LogWriterOptions,
     #[serde(default)]
     pub reader: LogReaderOptions,
+    #[serde(default)]
+    pub cache: Option<CacheConfig>,
     #[serde(default = "LogServerConfig::default_record_count_threshold")]
     pub record_count_threshold: u64,
     #[serde(default = "LogServerConfig::default_reinsert_threshold")]
@@ -1323,6 +1414,7 @@ impl Default for LogServerConfig {
             storage: StorageConfig::default(),
             writer: LogWriterOptions::default(),
             reader: LogReaderOptions::default(),
+            cache: None,
             record_count_threshold: Self::default_record_count_threshold(),
             reinsert_threshold: Self::default_reinsert_threshold(),
             timeout_us: Self::default_timeout_us(),
@@ -1336,6 +1428,21 @@ impl Configurable<LogServerConfig> for LogServer {
         config: &LogServerConfig,
         registry: &chroma_config::registry::Registry,
     ) -> Result<Self, Box<dyn ChromaError>> {
+        let cache = if let Some(cache_config) = &config.cache {
+            match chroma_cache::from_config_persistent::<String, CachedParquetFragment>(
+                cache_config,
+            )
+            .await
+            {
+                Ok(cache) => Some(cache),
+                Err(err) => {
+                    tracing::error!("cache not configured: {err:?}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let storage = Storage::try_from_config(&config.storage, registry).await?;
         let storage = Arc::new(storage);
         let dirty_log = LogWriter::open_or_initialize(
@@ -1355,6 +1462,7 @@ impl Configurable<LogServerConfig> for LogServer {
             storage,
             dirty_log,
             compacting,
+            cache,
         })
     }
 }

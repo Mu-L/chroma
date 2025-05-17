@@ -1,6 +1,8 @@
 package model
 
 import (
+	"time"
+
 	"github.com/chroma-core/chroma/go/pkg/types"
 )
 
@@ -21,6 +23,10 @@ type Collection struct {
 	TotalRecordsPostCompaction uint64
 	SizeBytesPostCompaction    uint64 // Note: This represents the size of the records off the log
 	LastCompactionTimeSecs     uint64
+	IsDeleted                  bool
+	VersionFileName            string
+	CreatedAt                  time.Time
+	DatabaseId                 types.UniqueID
 }
 
 type CollectionToGc struct {
@@ -28,7 +34,7 @@ type CollectionToGc struct {
 	TenantID        string
 	Name            string
 	VersionFilePath string
-	LatestVersion   int64
+	LineageFilePath *string
 }
 
 type CreateCollection struct {

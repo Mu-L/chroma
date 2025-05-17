@@ -33,6 +33,10 @@ func convertCollectionToModel(collectionAndMetadataList []*dbmodel.CollectionAnd
 			LastCompactionTimeSecs:     collectionAndMetadata.Collection.LastCompactionTimeSecs,
 			RootCollectionID:           rootCollectionID,
 			LineageFileName:            collectionAndMetadata.Collection.LineageFileName,
+			IsDeleted:                  collectionAndMetadata.Collection.IsDeleted,
+			VersionFileName:            collectionAndMetadata.Collection.VersionFileName,
+			CreatedAt:                  collectionAndMetadata.Collection.CreatedAt,
+			DatabaseId:                 types.MustParse(collectionAndMetadata.Collection.DatabaseID),
 		}
 		collection.Metadata = convertCollectionMetadataToModel(collectionAndMetadata.CollectionMetadata)
 		collections = append(collections, collection)
@@ -51,8 +55,8 @@ func convertCollectionToGcToModel(collectionToGc []*dbmodel.CollectionToGc) []*m
 			ID:              types.MustParse(collectionInfo.ID),
 			Name:            collectionInfo.Name,
 			VersionFilePath: collectionInfo.VersionFileName,
-			LatestVersion:   int64(collectionInfo.Version),
 			TenantID:        collectionInfo.TenantID,
+			LineageFilePath: collectionInfo.LineageFileName,
 		}
 		collections = append(collections, &collection)
 	}

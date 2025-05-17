@@ -444,14 +444,14 @@ func (tc *Catalog) GetCollectionSize(ctx context.Context, collectionID types.Uni
 	return total_records_post_compaction, nil
 }
 
-func (tc *Catalog) ListCollectionsToGc(ctx context.Context, cutoffTimeSecs *uint64, limit *uint64) ([]*model.CollectionToGc, error) {
+func (tc *Catalog) ListCollectionsToGc(ctx context.Context, cutoffTimeSecs *uint64, limit *uint64, tenantID *string) ([]*model.CollectionToGc, error) {
 	tracer := otel.Tracer
 	if tracer != nil {
 		_, span := tracer.Start(ctx, "Catalog.ListCollectionsToGc")
 		defer span.End()
 	}
 
-	collectionsToGc, err := tc.metaDomain.CollectionDb(ctx).ListCollectionsToGc(cutoffTimeSecs, limit)
+	collectionsToGc, err := tc.metaDomain.CollectionDb(ctx).ListCollectionsToGc(cutoffTimeSecs, limit, tenantID)
 
 	if err != nil {
 		return nil, err
@@ -460,7 +460,7 @@ func (tc *Catalog) ListCollectionsToGc(ctx context.Context, cutoffTimeSecs *uint
 	return collections, nil
 }
 
-func (tc *Catalog) GetCollectionWithSegments(ctx context.Context, collectionID types.UniqueID) (*model.Collection, []*model.Segment, error) {
+func (tc *Catalog) GetCollectionWithSegments(ctx context.Context, collectionID types.UniqueID, returnSoftDeleted bool) (*model.Collection, []*model.Segment, error) {
 	tracer := otel.Tracer
 	if tracer != nil {
 		_, span := tracer.Start(ctx, "Catalog.GetCollections")
@@ -471,23 +471,23 @@ func (tc *Catalog) GetCollectionWithSegments(ctx context.Context, collectionID t
 	var segments []*model.Segment
 
 	err := tc.txImpl.Transaction(ctx, func(txCtx context.Context) error {
-		collections, e := tc.GetCollections(txCtx, collectionID, nil, "", "", nil, nil)
+		collection_entry, e := tc.GetCollection(txCtx, collectionID, nil, "", "")
 		if e != nil {
 			return e
 		}
-		if len(collections) == 0 {
+		if collection_entry == nil {
 			return common.ErrCollectionNotFound
 		}
-		if len(collections) > 1 {
-			return common.ErrCollectionUniqueConstraintViolation
+		if collection_entry.IsDeleted && !returnSoftDeleted {
+			return common.ErrCollectionNotFound
 		}
-		collection = collections[0]
 
 		segments, e = tc.GetSegments(txCtx, types.NilUniqueID(), nil, nil, collectionID)
 		if e != nil {
 			return e
 		}
 
+		collection = collection_entry
 		return nil
 	})
 	if err != nil {
@@ -876,7 +876,7 @@ func (tc *Catalog) ForkCollection(ctx context.Context, forkCollection *model.For
 		}
 
 		// Get source and root collections after they are locked
-		sourceCollection, sourceSegments, err = tc.GetCollectionWithSegments(txCtx, forkCollection.SourceCollectionID)
+		sourceCollection, sourceSegments, err = tc.GetCollectionWithSegments(txCtx, forkCollection.SourceCollectionID, false)
 		if err != nil {
 			return err
 		}
@@ -932,17 +932,18 @@ func (tc *Catalog) ForkCollection(ctx context.Context, forkCollection *model.For
 			LastCompactionTimeSecs:     sourceCollection.LastCompactionTimeSecs,
 		}
 
-		createSegments := []*model.CreateSegment{}
+		createSegments := []*model.Segment{}
 		flushFilePaths := []*model.FlushSegmentCompaction{}
 		for _, segment := range sourceSegments {
 			newSegmentID := types.NewUniqueID()
-			createSegment := &model.CreateSegment{
+			createSegment := &model.Segment{
 				ID:           newSegmentID,
 				Type:         segment.Type,
 				Scope:        segment.Scope,
 				CollectionID: forkCollection.TargetCollectionID,
 				Metadata:     segment.Metadata,
 				Ts:           ts.Unix(),
+				FilePaths:    segment.FilePaths,
 			}
 			createSegments = append(createSegments, createSegment)
 			flushFilePath := &model.FlushSegmentCompaction{
@@ -967,8 +968,7 @@ func (tc *Catalog) ForkCollection(ctx context.Context, forkCollection *model.For
 		if err != nil {
 			return err
 		}
-		// NOTE: This is a temporary hardcoded limit for the size of the lineage file
-		// TODO: Load the limit value from quota / scorecard, and/or improve the lineage file design to avoid large lineage file
+		// Defensive backstop to prevent too many forks
 		if len(lineageFile.Dependencies) > 1000000 {
 			return common.ErrCollectionTooManyFork
 		}
@@ -990,10 +990,52 @@ func (tc *Catalog) ForkCollection(ctx context.Context, forkCollection *model.For
 		return nil, nil, err
 	}
 
-	return tc.GetCollectionWithSegments(ctx, forkCollection.TargetCollectionID)
+	return tc.GetCollectionWithSegments(ctx, forkCollection.TargetCollectionID, false)
 }
 
-func (tc *Catalog) CreateSegment(ctx context.Context, createSegment *model.CreateSegment, ts types.Timestamp) (*model.Segment, error) {
+func (tc *Catalog) CountForks(ctx context.Context, sourceCollectionID types.UniqueID) (uint64, error) {
+	var rootCollectionID types.UniqueID
+
+	sourceCollectionIDStr := sourceCollectionID.String()
+	sourceCollectionDb, err := tc.metaDomain.CollectionDb(ctx).GetCollectionEntry(&sourceCollectionIDStr, nil)
+	if err != nil {
+		return 0, err
+	}
+	if sourceCollectionDb == nil {
+		return 0, common.ErrCollectionNotFound
+	}
+
+	if len(sourceCollectionDb.RootCollectionId) > 0 {
+		rootCollectionID, err = types.Parse(sourceCollectionDb.RootCollectionId)
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		rootCollectionID = sourceCollectionID
+	}
+
+	limit := int32(1)
+	collections, err := tc.GetCollections(ctx, rootCollectionID, nil, "", "", &limit, nil)
+	if err != nil {
+		return 0, err
+	}
+	if len(collections) == 0 {
+		return 0, common.ErrCollectionNotFound
+	}
+	rootCollection := collections[0]
+
+	lineageFile, err := tc.getLineageFile(ctx, rootCollection)
+	if err != nil {
+		return 0, err
+	}
+
+	if lineageFile == nil || lineageFile.Dependencies == nil {
+		return 0, nil
+	}
+	return uint64(len(lineageFile.Dependencies)), nil
+}
+
+func (tc *Catalog) CreateSegment(ctx context.Context, createSegment *model.Segment, ts types.Timestamp) (*model.Segment, error) {
 	var result *model.Segment
 
 	err := tc.txImpl.Transaction(ctx, func(txCtx context.Context) error {
@@ -1009,7 +1051,7 @@ func (tc *Catalog) CreateSegment(ctx context.Context, createSegment *model.Creat
 	return result, nil
 }
 
-func (tc *Catalog) createSegmentImpl(txCtx context.Context, createSegment *model.CreateSegment, ts types.Timestamp) (*model.Segment, error) {
+func (tc *Catalog) createSegmentImpl(txCtx context.Context, createSegment *model.Segment, ts types.Timestamp) (*model.Segment, error) {
 	var result *model.Segment
 
 	// insert segment
@@ -1049,7 +1091,21 @@ func (tc *Catalog) createSegmentImpl(txCtx context.Context, createSegment *model
 	return result, nil
 }
 
-func (tc *Catalog) createFirstVersionFile(ctx context.Context, databaseID string, createCollection *model.CreateCollection, createSegments []*model.CreateSegment, ts types.Timestamp) (string, error) {
+func (tc *Catalog) createFirstVersionFile(ctx context.Context, databaseID string, createCollection *model.CreateCollection, createSegments []*model.Segment, ts types.Timestamp) (string, error) {
+	segmentCompactionInfos := make([]*coordinatorpb.FlushSegmentCompactionInfo, 0, len(createSegments))
+	for _, segment := range createSegments {
+		convertedPaths := make(map[string]*coordinatorpb.FilePaths)
+		for k, v := range segment.FilePaths {
+			convertedPaths[k] = &coordinatorpb.FilePaths{Paths: v}
+		}
+
+		info := &coordinatorpb.FlushSegmentCompactionInfo{
+			SegmentId: segment.ID.String(),
+			FilePaths: convertedPaths,
+		}
+		segmentCompactionInfos = append(segmentCompactionInfos, info)
+	}
+
 	collectionVersionFilePb := &coordinatorpb.CollectionVersionFile{
 		CollectionInfoImmutable: &coordinatorpb.CollectionInfoImmutable{
 			TenantId:               createCollection.TenantID,
@@ -1063,6 +1119,9 @@ func (tc *Catalog) createFirstVersionFile(ctx context.Context, databaseID string
 				{
 					Version:       0,
 					CreatedAtSecs: int64(ts),
+					SegmentInfo: &coordinatorpb.CollectionSegmentInfo{
+						SegmentCompactionInfo: segmentCompactionInfos,
+					},
 				},
 			},
 		},
@@ -1076,7 +1135,7 @@ func (tc *Catalog) createFirstVersionFile(ctx context.Context, databaseID string
 	return fullFilePath, nil
 }
 
-func (tc *Catalog) CreateCollectionAndSegments(ctx context.Context, createCollection *model.CreateCollection, createSegments []*model.CreateSegment, ts types.Timestamp) (*model.Collection, bool, error) {
+func (tc *Catalog) CreateCollectionAndSegments(ctx context.Context, createCollection *model.CreateCollection, createSegments []*model.Segment, ts types.Timestamp) (*model.Collection, bool, error) {
 	var resultCollection *model.Collection
 	created := false
 
@@ -1348,20 +1407,35 @@ func (tc *Catalog) ListCollectionVersions(ctx context.Context,
 	return filteredVersions, nil
 }
 
-func (tc *Catalog) updateVersionFileInS3(ctx context.Context, existingVersionFilePb *coordinatorpb.CollectionVersionFile, flushCollectionCompaction *model.FlushCollectionCompaction, ts_secs int64) (string, error) {
+func (tc *Catalog) updateVersionFileInS3(existingVersionFilePb *coordinatorpb.CollectionVersionFile, flushCollectionCompaction *model.FlushCollectionCompaction, previousSegmentInfo []*model.Segment, ts_secs int64) (string, error) {
 	segmentCompactionInfos := make([]*coordinatorpb.FlushSegmentCompactionInfo, 0, len(flushCollectionCompaction.FlushSegmentCompactions))
-	for _, compaction := range flushCollectionCompaction.FlushSegmentCompactions {
-		// Convert map[string][]string to map[string]*coordinatorpb.FilePaths
-		convertedPaths := make(map[string]*coordinatorpb.FilePaths)
-		for k, v := range compaction.FilePaths {
-			convertedPaths[k] = &coordinatorpb.FilePaths{Paths: v}
+	// If flushCollectionCompaction.FlushSegmentCompactions is empty then use previousSegmentInfo.
+	if len(flushCollectionCompaction.FlushSegmentCompactions) == 0 {
+		for _, segment := range previousSegmentInfo {
+			convertedPaths := make(map[string]*coordinatorpb.FilePaths)
+			for k, v := range segment.FilePaths {
+				convertedPaths[k] = &coordinatorpb.FilePaths{Paths: v}
+			}
+			info := &coordinatorpb.FlushSegmentCompactionInfo{
+				SegmentId: segment.ID.String(),
+				FilePaths: convertedPaths,
+			}
+			segmentCompactionInfos = append(segmentCompactionInfos, info)
 		}
+	} else {
+		for _, compaction := range flushCollectionCompaction.FlushSegmentCompactions {
+			// Convert map[string][]string to map[string]*coordinatorpb.FilePaths
+			convertedPaths := make(map[string]*coordinatorpb.FilePaths)
+			for k, v := range compaction.FilePaths {
+				convertedPaths[k] = &coordinatorpb.FilePaths{Paths: v}
+			}
 
-		info := &coordinatorpb.FlushSegmentCompactionInfo{
-			SegmentId: compaction.ID.String(),
-			FilePaths: convertedPaths,
+			info := &coordinatorpb.FlushSegmentCompactionInfo{
+				SegmentId: compaction.ID.String(),
+				FilePaths: convertedPaths,
+			}
+			segmentCompactionInfos = append(segmentCompactionInfos, info)
 		}
-		segmentCompactionInfos = append(segmentCompactionInfos, info)
 	}
 
 	existingVersionFilePb.GetVersionHistory().Versions = append(existingVersionFilePb.GetVersionHistory().Versions, &coordinatorpb.CollectionVersionInfo{
@@ -1503,7 +1577,7 @@ func (tc *Catalog) FlushCollectionCompactionForVersionedCollection(ctx context.C
 	for numAttempts < maxAttempts {
 		numAttempts++
 		// Get the current version info and the version file from the table.
-		collectionEntry, err := tc.metaDomain.CollectionDb(ctx).GetCollectionEntry(types.FromUniqueID(flushCollectionCompaction.ID), nil)
+		collectionEntry, segments, err := tc.GetCollectionWithSegments(ctx, flushCollectionCompaction.ID, true)
 		if err != nil {
 			return nil, err
 		}
@@ -1538,10 +1612,10 @@ func (tc *Catalog) FlushCollectionCompactionForVersionedCollection(ctx context.C
 			// The VersionFile has not been created.
 			existingVersionFilePb = &coordinatorpb.CollectionVersionFile{
 				CollectionInfoImmutable: &coordinatorpb.CollectionInfoImmutable{
-					TenantId:               collectionEntry.Tenant,
-					DatabaseId:             collectionEntry.DatabaseID,
-					CollectionId:           collectionEntry.ID,
-					CollectionName:         *collectionEntry.Name,
+					TenantId:               collectionEntry.TenantID,
+					DatabaseId:             collectionEntry.DatabaseId.String(),
+					CollectionId:           collectionEntry.ID.String(),
+					CollectionName:         collectionEntry.Name,
 					CollectionCreationSecs: collectionEntry.CreatedAt.Unix(),
 				},
 				VersionHistory: &coordinatorpb.CollectionVersionHistory{
@@ -1557,10 +1631,10 @@ func (tc *Catalog) FlushCollectionCompactionForVersionedCollection(ctx context.C
 
 			// There was previously a bug that resulted in the tenant ID missing from some version files (https://github.com/chroma-core/chroma/pull/4408).
 			// This line can be removed once all corrupted version files are fixed.
-			existingVersionFilePb.CollectionInfoImmutable.TenantId = collectionEntry.Tenant
+			existingVersionFilePb.CollectionInfoImmutable.TenantId = collectionEntry.TenantID
 
 			// Do a simple validation of the version file.
-			err = tc.validateVersionFile(existingVersionFilePb, collectionEntry.ID, existingVersion)
+			err = tc.validateVersionFile(existingVersionFilePb, collectionEntry.ID.String(), existingVersion)
 			if err != nil {
 				log.Error("version file validation failed", zap.Error(err))
 				return nil, err
@@ -1570,7 +1644,7 @@ func (tc *Catalog) FlushCollectionCompactionForVersionedCollection(ctx context.C
 		// The update function takes the content of the existing version file,
 		// and the set of segments that are part of the new version file.
 		// NEW VersionFile is created in S3 at this step.
-		newVersionFileName, err := tc.updateVersionFileInS3(ctx, existingVersionFilePb, flushCollectionCompaction, time.Now().Unix())
+		newVersionFileName, err := tc.updateVersionFileInS3(existingVersionFilePb, flushCollectionCompaction, segments, time.Now().Unix())
 		if err != nil {
 			return nil, err
 		}

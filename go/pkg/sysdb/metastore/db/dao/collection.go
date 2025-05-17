@@ -49,24 +49,37 @@ func (s *collectionDb) GetCollectionEntry(collectionID *string, databaseName *st
 }
 
 func (s *collectionDb) GetCollectionEntries(id *string, name *string, tenantID string, databaseName string, limit *int32, offset *int32) ([]*dbmodel.CollectionAndMetadata, error) {
-	return s.getCollections(id, name, tenantID, databaseName, limit, offset, true)
+	return s.getCollections(id, name, tenantID, databaseName, limit, offset, nil)
 }
 
 func (s *collectionDb) GetCollections(id *string, name *string, tenantID string, databaseName string, limit *int32, offset *int32) ([]*dbmodel.CollectionAndMetadata, error) {
-	return s.getCollections(id, name, tenantID, databaseName, limit, offset, false)
+	is_deleted := false
+	return s.getCollections(id, name, tenantID, databaseName, limit, offset, &is_deleted)
 }
 
-func (s *collectionDb) ListCollectionsToGc(cutoffTimeSecs *uint64, limit *uint64) ([]*dbmodel.CollectionToGc, error) {
-	var collections []*dbmodel.CollectionToGc
-	// Use the read replica for this so as to not overwhelm the writer.
-	query := s.read_db.Table("collections").
-		Select("collections.id, collections.name, collections.version, collections.version_file_name, collections.oldest_version_ts, collections.num_versions, databases.tenant_id").
-		Joins("INNER JOIN databases ON collections.database_id = databases.id").
-		Where("version > 0").
+func (s *collectionDb) ListCollectionsToGc(cutoffTimeSecs *uint64, limit *uint64, tenantID *string) ([]*dbmodel.CollectionToGc, error) {
+	// There are three types of collections:
+	// 1. Regular: a collection created by a normal call to create_collection(). Does not have a root_collection_id or a lineage_file_name.
+	// 2. Root of fork tree: a collection created by a call to create_collection() which was later the source of a fork with fork(). Has a lineage_file_name.
+	// 3. Fork of a root: a collection created by a call to fork(). Has a root_collection_id.
+	//
+	// For the purposes of this method, we group by fork "trees". A fork tree is a root collection and all its forks (or, in the case of regular collections, a single collection). For every fork tree, we check if at least one collection in the tree meets the GC requirements. If so, we return the root collection of the tree. We ignore forks in the response as the garbage collector will GC forks when run on the root collection.
+
+	sub := s.read_db.Table("collections").
+		Select("COALESCE(NULLIF(root_collection_id, ''), id) AS id, MIN(oldest_version_ts) AS min_oldest_version_ts").
+		Group("COALESCE(NULLIF(root_collection_id, ''), id)").
 		Where("version_file_name IS NOT NULL").
-		Where("version_file_name != ''").
-		Where("root_collection_id IS NULL OR root_collection_id = ''").
-		Where("lineage_file_name IS NULL OR lineage_file_name = ''")
+		Where("version_file_name != ''")
+
+	if tenantID != nil {
+		sub = sub.Where("tenant = ?", *tenantID)
+	}
+
+	query := s.read_db.Table("collections").
+		Select("collections.id, collections.name, collections.version_file_name, sub.min_oldest_version_ts AS oldest_version_ts, databases.tenant_id, NULLIF(collections.lineage_file_name, '') AS lineage_file_name").
+		Joins("INNER JOIN databases ON collections.database_id = databases.id").
+		Joins("INNER JOIN (?) AS sub ON collections.id = sub.id", sub)
+
 	// Apply cutoff time filter only if provided
 	if cutoffTimeSecs != nil {
 		cutoffTime := time.Unix(int64(*cutoffTimeSecs), 0)
@@ -80,6 +93,7 @@ func (s *collectionDb) ListCollectionsToGc(cutoffTimeSecs *uint64, limit *uint64
 		query = query.Limit(int(*limit))
 	}
 
+	var collections []*dbmodel.CollectionToGc
 	err := query.Find(&collections).Error
 	if err != nil {
 		return nil, err
@@ -88,7 +102,7 @@ func (s *collectionDb) ListCollectionsToGc(cutoffTimeSecs *uint64, limit *uint64
 	return collections, nil
 }
 
-func (s *collectionDb) getCollections(id *string, name *string, tenantID string, databaseName string, limit *int32, offset *int32, is_deleted bool) (collectionWithMetdata []*dbmodel.CollectionAndMetadata, err error) {
+func (s *collectionDb) getCollections(id *string, name *string, tenantID string, databaseName string, limit *int32, offset *int32, is_deleted *bool) (collectionWithMetdata []*dbmodel.CollectionAndMetadata, err error) {
 	type Result struct {
 		// Collection fields
 		CollectionId               string     `gorm:"column:collection_id"`
@@ -139,7 +153,9 @@ func (s *collectionDb) getCollections(id *string, name *string, tenantID string,
 	if name != nil {
 		query = query.Where("collections.name = ?", *name)
 	}
-	query = query.Where("collections.is_deleted = ?", is_deleted)
+	if is_deleted != nil {
+		query = query.Where("collections.is_deleted = ?", *is_deleted)
+	}
 
 	if limit != nil {
 		query = query.Limit(int(*limit))
@@ -306,7 +322,8 @@ func (s *collectionDb) GetCollectionSize(id string) (uint64, error) {
 }
 
 func (s *collectionDb) GetSoftDeletedCollections(collectionID *string, tenantID string, databaseName string, limit int32) ([]*dbmodel.CollectionAndMetadata, error) {
-	return s.getCollections(collectionID, nil, tenantID, databaseName, &limit, nil, true)
+	is_deleted := true
+	return s.getCollections(collectionID, nil, tenantID, databaseName, &limit, nil, &is_deleted)
 }
 
 // NOTE: This is the only method to do a hard delete of a single collection.
